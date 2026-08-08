@@ -3,7 +3,6 @@
 //! This module provides a flexible interface to load HuggingFace models via ONNX Runtime
 //! and perform text embedding (vectorization). It supports CPU, GPU, and NPU hardware acceleration.
 
-use ort::ep::{CUDA, CoreML, DirectML, OpenVINO};
 use ort::session::Session;
 use ort::value::Tensor;
 use thiserror::Error;
@@ -93,25 +92,38 @@ impl Vectorizer {
 
         // Configure Hardware Acceleration (Execution Providers)
         builder = match config.device {
+            Device::Auto => {
+                #[allow(unused_mut)]
+                let mut b = builder;
+                #[cfg(feature = "coreml")]
+                { b = b.with_execution_providers([ort::ep::CoreML::default().build()]).unwrap_or(b); }
+                #[cfg(feature = "openvino")]
+                { b = b.with_execution_providers([ort::ep::OpenVINO::default().build()]).unwrap_or(b); }
+                #[cfg(feature = "directml")]
+                { b = b.with_execution_providers([ort::ep::DirectML::default().build()]).unwrap_or(b); }
+                #[cfg(feature = "cuda")]
+                { b = b.with_execution_providers([ort::ep::CUDA::default().build()]).unwrap_or(b); }
+                b
+            }
             Device::CPU => builder,
-            Device::GPU => builder
-                .with_execution_providers([CUDA::default().build()])
-                .map_err(|e| VectorizerError::SessionError(e.to_string()))?,
-            Device::NPU => builder
-                .with_execution_providers([
-                    OpenVINO::default().build(),
-                    CoreML::default().build(),
-                    DirectML::default().build(),
-                ])
-                .map_err(|e| VectorizerError::SessionError(e.to_string()))?,
-            Device::Auto => builder
-                .with_execution_providers([
-                    OpenVINO::default().build(),
-                    CoreML::default().build(),
-                    DirectML::default().build(),
-                    CUDA::default().build(),
-                ])
-                .map_err(|e| VectorizerError::SessionError(e.to_string()))?,
+            Device::GPU => {
+                #[allow(unused_mut)]
+                let mut b = builder;
+                #[cfg(feature = "cuda")]
+                { b = b.with_execution_providers([ort::ep::CUDA::default().build()]).unwrap_or(b); }
+                b
+            }
+            Device::NPU => {
+                #[allow(unused_mut)]
+                let mut b = builder;
+                #[cfg(feature = "coreml")]
+                { b = b.with_execution_providers([ort::ep::CoreML::default().build()]).unwrap_or(b); }
+                #[cfg(feature = "openvino")]
+                { b = b.with_execution_providers([ort::ep::OpenVINO::default().build()]).unwrap_or(b); }
+                #[cfg(feature = "directml")]
+                { b = b.with_execution_providers([ort::ep::DirectML::default().build()]).unwrap_or(b); }
+                b
+            }
         };
 
         let session = builder.commit_from_file(&config.model_path)
@@ -208,14 +220,9 @@ impl Vectorizer {
                     }
                 }
             }
-            PoolingStrategy::Cls => {
+            PoolingStrategy::Cls | PoolingStrategy::None => {
                 for j in 0..hidden_size {
                     pooled[j] = output_data[j]; // Берем первый токен (индекс 0)
-                }
-            },
-            PoolingStrategy::None => {
-                for j in 0..hidden_size {
-                    pooled[j] = output_data[j];
                 }
             }
         }
@@ -232,12 +239,12 @@ impl Vectorizer {
     }
 
     /// Returns a human-readable string indicating the chosen execution provider.
-    pub fn device_info(&self) -> String {
+    pub fn device_info(&self) -> &'static str {
         match self.config.device {
-            Device::Auto => "Auto (NPU -> GPU -> CPU)".to_string(),
-            Device::CPU => "CPU (Fallback)".to_string(),
-            Device::GPU => "GPU (CUDA)".to_string(),
-            Device::NPU => "NPU (CoreML / OpenVINO / DirectML)".to_string(),
+            Device::Auto => "Auto (NPU -> GPU -> CPU)",
+            Device::CPU => "CPU (Fallback)",
+            Device::GPU => "GPU (CUDA)",
+            Device::NPU => "NPU (CoreML / OpenVINO / DirectML)",
         }
     }
 }

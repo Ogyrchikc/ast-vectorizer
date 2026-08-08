@@ -5,6 +5,14 @@ edition = "2024"
 
 [dependencies]
 ndarray = "0.17.2"
-ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls", "cuda", "coreml", "openvino", "directml", "lax-feature-matching"] }
+ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "download-binaries", "tls-rustls", "lax-feature-matching"] }
 thiserror = "2.0.20"
 tokenizers = "0.23.1"
+
+# Опциональные фичи для ускорения
+[features]
+default = []
+cuda = ["ort/cuda"]
+coreml = ["ort/coreml"]
+openvino = ["ort/openvino"]
+directml = ["ort/directml"]
