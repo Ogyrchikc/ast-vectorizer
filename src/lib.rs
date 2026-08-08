@@ -58,6 +58,8 @@ pub struct VectorizerConfig {
     pub pooling: PoolingStrategy,
     /// Preferred hardware device for inference.
     pub device: Device,
+    /// Maximum sequence length for the tokenizer (e.g., 512 for MiniLM).
+    pub max_seq_length: usize,
 }
 
 /// The core Vectorizer holding the ONNX session and the tokenizer.
@@ -75,11 +77,19 @@ impl Vectorizer {
     /// # Arguments
     /// * `config` - The configuration defining model paths and execution settings.
     pub fn new(config: VectorizerConfig) -> Result<Self, VectorizerError> {
-        let tokenizer = Tokenizer::from_file(&config.tokenizer_path)
+        let mut tokenizer = Tokenizer::from_file(&config.tokenizer_path)
             .map_err(|e| VectorizerError::TokenizerError(e.to_string()))?;
 
-        let mut builder =
-            Session::builder().map_err(|e| VectorizerError::SessionError(e.to_string()))?;
+        // Включаем обрезку текста, чтобы не упасть на длинных входных данных
+        let truncation = tokenizers::TruncationParams {
+            max_length: config.max_seq_length,
+            ..Default::default()
+        };
+        tokenizer.with_truncation(Some(truncation))
+            .map_err(|e| VectorizerError::TokenizerError(e.to_string()))?;
+
+        let mut builder = Session::builder()
+            .map_err(|e| VectorizerError::SessionError(e.to_string()))?;
 
         // Configure Hardware Acceleration (Execution Providers)
         builder = match config.device {
@@ -200,9 +210,9 @@ impl Vectorizer {
             }
             PoolingStrategy::Cls => {
                 for j in 0..hidden_size {
-                    pooled[j] = output_data[0 * hidden_size + j];
+                    pooled[j] = output_data[j]; // Берем первый токен (индекс 0)
                 }
-            }
+            },
             PoolingStrategy::None => {
                 for j in 0..hidden_size {
                     pooled[j] = output_data[j];
@@ -243,6 +253,7 @@ mod tests {
             tokenizer_path: "models/all-MiniLM-L6-v2/tokenizer.json".to_string(),
             pooling: PoolingStrategy::Mean,
             device: Device::CPU, // Forced to CPU for reliable testing
+            max_seq_length: 512,
         }
     }
 
@@ -253,6 +264,7 @@ mod tests {
             tokenizer_path: "models/all-MiniLM-L6-v2/tokenizer.json".to_string(),
             pooling: PoolingStrategy::Mean,
             device: Device::CPU,
+            max_seq_length: 512,
         };
 
         let result = Vectorizer::new(config);
