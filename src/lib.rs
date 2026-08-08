@@ -6,8 +6,8 @@
 use ort::ep::{CUDA, CoreML, DirectML, OpenVINO};
 use ort::session::Session;
 use ort::value::Tensor;
-use tokenizers::Tokenizer;
 use thiserror::Error;
+use tokenizers::Tokenizer;
 
 /// Errors that can occur during the vectorization process.
 #[derive(Error, Debug)]
@@ -58,8 +58,6 @@ pub struct VectorizerConfig {
     pub pooling: PoolingStrategy,
     /// Preferred hardware device for inference.
     pub device: Device,
-    /// Whether to pass token_type_ids to the model. True for models like MiniLM/BERT, false for RoBERTa/DistilBERT.
-    pub use_token_type_ids: bool,
 }
 
 /// The core Vectorizer holding the ONNX session and the tokenizer.
@@ -67,6 +65,8 @@ pub struct Vectorizer {
     session: Session,
     tokenizer: Tokenizer,
     config: VectorizerConfig,
+    use_token_type_ids: bool,
+    output_name: String,
 }
 
 impl Vectorizer {
@@ -78,37 +78,39 @@ impl Vectorizer {
         let tokenizer = Tokenizer::from_file(&config.tokenizer_path)
             .map_err(|e| VectorizerError::TokenizerError(e.to_string()))?;
 
-        let mut builder = Session::builder()
-            .map_err(|e| VectorizerError::SessionError(e.to_string()))?;
+        let mut builder =
+            Session::builder().map_err(|e| VectorizerError::SessionError(e.to_string()))?;
 
         // Configure Hardware Acceleration (Execution Providers)
         builder = match config.device {
             Device::CPU => builder,
-            Device::GPU => {
-                builder.with_execution_providers([CUDA::default().build()])
-                    .map_err(|e| VectorizerError::SessionError(e.to_string()))?
-            },
-            Device::NPU => {
-                builder.with_execution_providers([
+            Device::GPU => builder
+                .with_execution_providers([CUDA::default().build()])
+                .map_err(|e| VectorizerError::SessionError(e.to_string()))?,
+            Device::NPU => builder
+                .with_execution_providers([
                     OpenVINO::default().build(),
                     CoreML::default().build(),
-                    DirectML::default().build()
-                ]).map_err(|e| VectorizerError::SessionError(e.to_string()))?
-            },
-            Device::Auto => {
-                builder.with_execution_providers([
+                    DirectML::default().build(),
+                ])
+                .map_err(|e| VectorizerError::SessionError(e.to_string()))?,
+            Device::Auto => builder
+                .with_execution_providers([
                     OpenVINO::default().build(),
                     CoreML::default().build(),
                     DirectML::default().build(),
                     CUDA::default().build(),
-                ]).map_err(|e| VectorizerError::SessionError(e.to_string()))?
-            }
+                ])
+                .map_err(|e| VectorizerError::SessionError(e.to_string()))?,
         };
 
         let session = builder.commit_from_file(&config.model_path)
             .map_err(|e| VectorizerError::SessionError(e.to_string()))?;
 
-        Ok(Self { session, tokenizer, config })
+        let use_token_type_ids = session.inputs().iter().any(|input| input.name() == "token_type_ids");
+        let output_name = session.outputs()[0].name().to_string();
+
+        Ok(Self { session, tokenizer, config, use_token_type_ids, output_name })
     }
 
     /// Embeds the given text into a normalized float vector.
@@ -117,26 +119,36 @@ impl Vectorizer {
     /// * `text` - The input string (e.g., source code or a function representation).
     pub fn embed(&mut self, text: &str) -> Result<Vec<f32>, VectorizerError> {
         // Step 1: Tokenization
-        let encoding = self.tokenizer.encode(text, true)
+        let encoding = self
+            .tokenizer
+            .encode(text, true)
             .map_err(|e| VectorizerError::TokenizerError(e.to_string()))?;
 
         let input_ids = encoding.get_ids();
         let attention_mask = encoding.get_attention_mask();
         let type_ids = encoding.get_type_ids();
-        
+
         let seq_len = input_ids.len();
 
         // Step 2: Prepare Tensors
-        let input_ids_array = ndarray::Array2::from_shape_vec((1, seq_len), input_ids.iter().map(|&x| x as i64).collect())
-            .map_err(|e| VectorizerError::TensorError(e.to_string()))?;
-        let attention_mask_array = ndarray::Array2::from_shape_vec((1, seq_len), attention_mask.iter().map(|&x| x as i64).collect())
-            .map_err(|e| VectorizerError::TensorError(e.to_string()))?;
+        let input_ids_array = ndarray::Array2::from_shape_vec(
+            (1, seq_len),
+            input_ids.iter().map(|&x| x as i64).collect(),
+        )
+        .map_err(|e| VectorizerError::TensorError(e.to_string()))?;
+        let attention_mask_array = ndarray::Array2::from_shape_vec(
+            (1, seq_len),
+            attention_mask.iter().map(|&x| x as i64).collect(),
+        )
+        .map_err(|e| VectorizerError::TensorError(e.to_string()))?;
 
-        let input_ids_tensor = Tensor::from_array(input_ids_array).map_err(|e| VectorizerError::TensorError(e.to_string()))?;
-        let attention_mask_tensor = Tensor::from_array(attention_mask_array).map_err(|e| VectorizerError::TensorError(e.to_string()))?;
+        let input_ids_tensor = Tensor::from_array(input_ids_array)
+            .map_err(|e| VectorizerError::TensorError(e.to_string()))?;
+        let attention_mask_tensor = Tensor::from_array(attention_mask_array)
+            .map_err(|e| VectorizerError::TensorError(e.to_string()))?;
 
         // Step 3: Run Inference (Forward pass)
-        let outputs = if self.config.use_token_type_ids {
+        let outputs = if self.use_token_type_ids {
             let type_ids_array = ndarray::Array2::from_shape_vec((1, seq_len), type_ids.iter().map(|&x| x as i64).collect())
                 .map_err(|e| VectorizerError::TensorError(e.to_string()))?;
             let type_ids_tensor = Tensor::from_array(type_ids_array).map_err(|e| VectorizerError::TensorError(e.to_string()))?;
@@ -155,12 +167,14 @@ impl Vectorizer {
             self.session.run(inputs).map_err(|e| VectorizerError::InferenceError(e.to_string()))?
         };
 
-        // Extract raw data from the ONNX output
-        let (output_shape, output_data) = outputs["last_hidden_state"]
+        // Extract raw data from the ONNX output using dynamic output name
+        let (output_shape, output_data) = outputs[self.output_name.as_str()]
             .try_extract_tensor::<f32>()
             .map_err(|e| VectorizerError::TensorError(e.to_string()))?;
 
-        let hidden_size = output_shape[2] as usize;
+        let hidden_size = *output_shape.get(2).ok_or_else(|| 
+            VectorizerError::TensorError(format!("Unexpected output tensor shape: {:?}", output_shape))
+        )? as usize;
         let mut pooled = vec![0.0f32; hidden_size];
 
         // Step 4: Pooling
@@ -183,12 +197,12 @@ impl Vectorizer {
                         pooled[j] /= sum_mask;
                     }
                 }
-            },
+            }
             PoolingStrategy::Cls => {
                 for j in 0..hidden_size {
                     pooled[j] = output_data[0 * hidden_size + j];
                 }
-            },
+            }
             PoolingStrategy::None => {
                 for j in 0..hidden_size {
                     pooled[j] = output_data[j];
@@ -197,16 +211,11 @@ impl Vectorizer {
         }
 
         // Step 5: L2 Normalization (Cosine Similarity preparation)
-        let mut norm = 0.0;
-        for j in 0..hidden_size {
-            norm += pooled[j] * pooled[j];
-        }
+        let norm: f32 = pooled.iter().map(|&x| x * x).sum();
+        let norm = norm.sqrt();
         
-        norm = norm.sqrt();
         if norm > 0.0 {
-            for j in 0..hidden_size {
-                pooled[j] /= norm;
-            }
+            pooled.iter_mut().for_each(|x| *x /= norm);
         }
 
         Ok(pooled)
@@ -234,7 +243,6 @@ mod tests {
             tokenizer_path: "models/all-MiniLM-L6-v2/tokenizer.json".to_string(),
             pooling: PoolingStrategy::Mean,
             device: Device::CPU, // Forced to CPU for reliable testing
-            use_token_type_ids: true,
         }
     }
 
@@ -245,38 +253,48 @@ mod tests {
             tokenizer_path: "models/all-MiniLM-L6-v2/tokenizer.json".to_string(),
             pooling: PoolingStrategy::Mean,
             device: Device::CPU,
-            use_token_type_ids: true,
         };
-        
+
         let result = Vectorizer::new(config);
-        assert!(result.is_err(), "Vectorizer should fail to initialize with a bad model path");
+        assert!(
+            result.is_err(),
+            "Vectorizer should fail to initialize with a bad model path"
+        );
     }
 
     #[test]
     fn test_successful_vectorization() {
-        let mut vectorizer = Vectorizer::new(get_test_config()).expect("Failed to initialize test vectorizer");
-        
+        let mut vectorizer =
+            Vectorizer::new(get_test_config()).expect("Failed to initialize test vectorizer");
+
         let sample_code = "def parse_ast(node):\n    pass";
         let vector = vectorizer.embed(sample_code).expect("Failed to embed text");
-        
+
         // all-MiniLM-L6-v2 outputs exactly 384 dimensions
         assert_eq!(vector.len(), 384, "Embedding length must be exactly 384");
     }
 
     #[test]
     fn test_l2_normalization() {
-        let mut vectorizer = Vectorizer::new(get_test_config()).expect("Failed to initialize test vectorizer");
-        
-        let vector = vectorizer.embed("Test sentence for normalization").expect("Failed to embed");
-        
+        let mut vectorizer =
+            Vectorizer::new(get_test_config()).expect("Failed to initialize test vectorizer");
+
+        let vector = vectorizer
+            .embed("Test sentence for normalization")
+            .expect("Failed to embed");
+
         // Calculate the sum of squares
         let mut sum_of_squares = 0.0;
         for &val in &vector {
             sum_of_squares += val * val;
         }
-        
+
         // It should be extremely close to 1.0
         let difference = (1.0 - sum_of_squares).abs();
-        assert!(difference < 1e-5, "Vector is not properly L2 normalized! Sum of squares: {}", sum_of_squares);
+        assert!(
+            difference < 1e-5,
+            "Vector is not properly L2 normalized! Sum of squares: {}",
+            sum_of_squares
+        );
     }
 }

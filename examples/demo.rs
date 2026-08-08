@@ -6,7 +6,6 @@ fn main() {
         tokenizer_path: "models/all-MiniLM-L6-v2/tokenizer.json".to_string(),
         pooling: PoolingStrategy::Mean,
         device: Device::Auto,
-        use_token_type_ids: true,
     };
 
     println!("Loading model...");
